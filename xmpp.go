@@ -62,6 +62,7 @@ type Conn struct {
 	in      *xml.Decoder
 	jid     string
 	archive bool
+	tls     bool
 
 	lock          sync.Mutex
 	inflights     map[Cookie]inflight
@@ -288,62 +289,137 @@ func (c *Conn) SetCustomStorage(space, local string, s interface{}) {
 }
 
 // rfc3920 section 5.2
-func (c *Conn) getFeatures(domain string) (features streamFeatures, err error) {
-	if _, err = fmt.Fprintf(c.out, "<?xml version='1.0'?><stream:stream to='%s' xmlns='%s' xmlns:stream='%s' version='1.0'>\n", xmlEscape(domain), NsClient, NsStream); err != nil {
-		return
+func (c *Conn) getFeatures(domain string) (*streamFeatures, error) {
+	_, err := fmt.Fprintf(c.out, "<?xml version='1.0'?><stream:stream to='%s' xmlns='%s' xmlns:stream='%s' version='1.0'>\n", xmlEscape(domain), NsClient, NsStream)
+	if err != nil {
+		return nil, err
 	}
 
 	se, err := nextStart(c.in)
 	if err != nil {
-		return
+		return nil, err
 	}
 	if se.Name.Space != NsStream || se.Name.Local != "stream" {
-		err = errors.New("xmpp: expected <stream> but got <" + se.Name.Local + "> in " + se.Name.Space)
-		return
+		return nil, errors.New("xmpp: expected <stream> but got <" + se.Name.Local + "> in " + se.Name.Space)
 	}
 
 	// Now we're in the stream and can use Unmarshal.
 	// Next message should be <features> to tell us authentication options.
 	// See section 4.6 in RFC 3920.
+	var features streamFeatures
 	if err = c.in.DecodeElement(&features, nil); err != nil {
-		err = errors.New("unmarshal <features>: " + err.Error())
-		return
+		return nil, errors.New("unmarshal <features>: " + err.Error())
 	}
-
-	return
+	return &features, nil
 }
 
-func (c *Conn) authenticate(features streamFeatures, user, password string) (err error) {
-	havePlain := false
-	for _, m := range features.Mechanisms.Mechanism {
-		if m == "PLAIN" {
-			havePlain = true
-			break
+func (c *Conn) bind(domain string, features *streamFeatures) error {
+	// Send IQ message asking to bind to the local user name.
+	fmt.Fprintf(c.out, "<iq type='set' id='bind_1'><bind xmlns='%s'/></iq>", NsBind)
+	var iq ClientIQ
+	if err := c.in.DecodeElement(&iq, nil); err != nil {
+		return errors.New("unmarshal <iq>: " + err.Error())
+	}
+	if &iq.Bind == nil {
+		return errors.New("<iq> result missing <bind>")
+	}
+	c.jid = iq.Bind.Jid // our local id
+
+	if features.Session != nil {
+		// The server needs a session to be established. See RFC 3921,
+		// section 3.
+		fmt.Fprintf(c.out, "<iq to='%s' type='set' id='sess_1'><session xmlns='%s'/></iq>", domain, NsSession)
+		if err := c.in.DecodeElement(&iq, nil); err != nil {
+			return errors.New("xmpp: unmarshal <iq>: " + err.Error())
+		}
+		if iq.Type != "result" {
+			return errors.New("xmpp: session establishment failed")
 		}
 	}
-	if !havePlain {
-		return errors.New("xmpp: PLAIN authentication is not an option")
-	}
-
-	// Plain authentication: send base64-encoded \x00 user \x00 password.
-	raw := "\x00" + user + "\x00" + password
-	enc := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
-	base64.StdEncoding.Encode(enc, []byte(raw))
-	fmt.Fprintf(c.rawOut, "<auth xmlns='%s' mechanism='PLAIN'>%s</auth>\n", NsSASL, enc)
-
-	// Next message should be either success or failure.
-	name, val, err := next(c)
-	switch v := val.(type) {
-	case *saslSuccess:
-	case *saslFailure:
-		// v.Any is type of sub-element in failure,
-		// which gives a description of what failed.
-		return errors.New("xmpp: authentication failure: " + v.Any.Local)
-	default:
-		return errors.New("expected <success> or <failure>, got <" + name.Local + "> in " + name.Space)
-	}
-
 	return nil
+}
+
+func (c *Conn) authenticate(domain string, features *streamFeatures, auth Auth) error {
+	info := &StreamInfo{
+		Domain:     domain,
+		TLS:        c.tls,
+		Mechanisms: features.Mechanisms.Mechanism,
+	}
+	mech, toServer, err := auth.Start(info)
+	if err != nil {
+		return errors.New("aborted handshake: " + err.Error())
+	}
+	if mech == "" {
+		return nil
+	}
+	if err = c.writesasl("auth", " mechanism='"+mech+"'", toServer); err != nil {
+		return err
+	}
+
+	// do the challenge/response dance until we get success or failure
+	for {
+		name, val, err := next(c)
+		if err != nil {
+			return err
+		}
+		switch v := val.(type) {
+		case *saslFailure:
+			// v.Any is type of sub-element in failure,
+			// which gives a description of what failed.
+			return errors.New("server signaled failure: " + v.Any.Local)
+		case *saslSuccess:
+			fromServer, err := sasldec(v.Body)
+			if err != nil {
+				return fmt.Errorf("couldn't decode success body: %v", err)
+			}
+			if _, err = auth.Next(fromServer, false); err != nil {
+				return fmt.Errorf("aborted handshake: %v", err)
+			}
+			return nil
+		case *saslChallenge:
+			fromServer, err := sasldec(v.Body)
+			if err != nil {
+				return fmt.Errorf("couldn't decode challenge body: %v", err)
+			}
+			if toServer, err = auth.Next(fromServer, true); err != nil {
+				return fmt.Errorf("aborted handshake: %v", err)
+			}
+			if err = c.writesasl("response", "", toServer); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("expected <success>, <failure> or <challenge>, got <%s> in %s: %v",
+				name.Local, name.Space, v)
+		}
+	}
+	panic("unreachable")
+}
+
+func (c *Conn) writesasl(name, attrs string, body []byte) error {
+	var enc []byte
+	if body != nil {
+		if len(body) == 0 {
+			enc = []byte{'='}
+		} else {
+			enc = make([]byte, base64.StdEncoding.EncodedLen(len(body)))
+			base64.StdEncoding.Encode(enc, body)
+		}
+	}
+	_, err := fmt.Fprintf(c.rawOut, "<%s xmlns='%s'%s>%s</%s>\n", name, NsSASL, attrs, enc, name)
+	return err
+}
+
+func sasldec(text []byte) ([]byte, error) {
+	switch {
+	case len(text) == 0:
+		return nil, nil
+	case len(text) == 1 && text[0] == '=':
+		return []byte{}, nil
+	default:
+		dec := make([]byte, base64.StdEncoding.DecodedLen(len(text)))
+		_, err := base64.StdEncoding.Decode(dec, text)
+		return dec, err
+	}
 }
 
 func certName(cert *x509.Certificate) string {
@@ -407,126 +483,15 @@ type Config struct {
 	SkipTLS bool
 }
 
-// Dial creates a new connection to an XMPP server, authenticates as the
-// given user.
-func Dial(address, user, domain, password string, config *Config) (c *Conn, err error) {
-	c = new(Conn)
-	c.inflights = make(map[Cookie]inflight)
-	c.archive = config.Archive
-
-	var log io.Writer
-	if config != nil && config.Log != nil {
-		log = config.Log
-	}
-
-	var conn net.Conn
-	if config != nil && config.Conn != nil {
-		conn = config.Conn
-	} else {
-		if log != nil {
-			io.WriteString(log, "Making TCP connection to "+address+"\n")
-		}
-
-		if conn, err = net.Dial("tcp", address); err != nil {
-			return nil, err
-		}
-	}
-
-	c.in, c.out = makeInOut(conn, config)
-
-	features, err := c.getFeatures(domain)
+func Dial(address, user, domain, password string, config *Config) (*Conn, error) {
+	c, features, err := startConn(address, domain, config)
 	if err != nil {
 		return nil, err
 	}
 
-	if !config.SkipTLS {
-		if features.StartTLS.XMLName.Local == "" {
-			return nil, errors.New("xmpp: server doesn't support TLS")
-		}
-
-		fmt.Fprintf(c.out, "<starttls xmlns='%s'/>", NsTLS)
-
-		proceed, err := nextStart(c.in)
-		if err != nil {
-			return nil, err
-		}
-		if proceed.Name.Space != NsTLS || proceed.Name.Local != "proceed" {
-			return nil, errors.New("xmpp: expected <proceed> after <starttls> but got <" + proceed.Name.Local + "> in " + proceed.Name.Space)
-		}
-
-		if log != nil {
-			io.WriteString(log, "Starting TLS handshake\n")
-		}
-
-		haveCertHash := len(config.ServerCertificateSHA256) != 0
-		tlsConfig := &tls.Config{
-			ServerName: domain,
-			InsecureSkipVerify: true,
-		}
-
-		tlsConn := tls.Client(conn, tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
-			return nil, err
-		}
-
-		tlsState := tlsConn.ConnectionState()
-		if haveCertHash {
-			h := sha256.New()
-			h.Write(tlsState.PeerCertificates[0].Raw)
-			if digest := h.Sum(nil); !bytes.Equal(digest, config.ServerCertificateSHA256) {
-				return nil, fmt.Errorf("xmpp: server certificate does not match expected hash (got: %x, want: %x)", digest, config.ServerCertificateSHA256)
-			}
-		} else {
-			if len(tlsState.PeerCertificates) == 0 {
-				return nil, errors.New("xmpp: server has no certificates")
-			}
-
-			opts := x509.VerifyOptions{
-				Intermediates: x509.NewCertPool(),
-			}
-			for _, cert := range tlsState.PeerCertificates[1:] {
-				opts.Intermediates.AddCert(cert)
-			}
-			verifiedChains, err := tlsState.PeerCertificates[0].Verify(opts)
-			if err != nil {
-				return nil, errors.New("xmpp: failed to verify TLS certificate: " + err.Error())
-			}
-
-			if log != nil {
-				for i, cert := range verifiedChains[0] {
-					fmt.Fprintf(log, "  certificate %d: %s\n", i, certName(cert))
-				}
-			}
-
-			if err := tlsConn.VerifyHostname(domain); err != nil {
-				if config.TrustedAddress {
-					if log != nil {
-						fmt.Fprintf(log, "Certificate fails to verify against domain in username: %s\n", err)
-					}
-					host, _, err := net.SplitHostPort(address)
-					if err != nil {
-						return nil, errors.New("xmpp: failed to split address when checking whether TLS certificate is valid: " + err.Error())
-					}
-					if err = tlsConn.VerifyHostname(host); err != nil {
-						return nil, errors.New("xmpp: failed to match TLS certificate to address after failing to match to username: " + err.Error())
-					}
-					if log != nil {
-						fmt.Fprintf(log, "Certificate matches against trusted server hostname: %s\n", host)
-					}
-				} else {
-					return nil, errors.New("xmpp: failed to match TLS certificate to name: " + err.Error())
-				}
-			}
-		}
-
-		c.in, c.out = makeInOut(tlsConn, config)
-		c.rawOut = tlsConn
-
-		if features, err = c.getFeatures(domain); err != nil {
-			return nil, err
-		}
-	} else {
-		c.rawOut = conn
+	var log io.Writer
+	if config != nil && config.Log != nil {
+		log = config.Log
 	}
 
 	if config != nil && config.Create {
@@ -546,41 +511,178 @@ func Dial(address, user, domain, password string, config *Config) (c *Conn, err 
 	if log != nil {
 		io.WriteString(log, "Authenticating as "+user+"\n")
 	}
-	if err := c.authenticate(features, user, password); err != nil {
-		return nil, err
+	if err := c.authenticate(domain, features, PlainAuth(user, password)); err != nil {
+		return nil, errors.New("xmpp: authentication failed: " + err.Error())
 	}
-
 	if log != nil {
 		io.WriteString(log, "Authentication successful\n")
 	}
-
 	if features, err = c.getFeatures(domain); err != nil {
 		return nil, err
 	}
 
-	// Send IQ message asking to bind to the local user name.
-	fmt.Fprintf(c.out, "<iq type='set' id='bind_1'><bind xmlns='%s'/></iq>", NsBind)
-	var iq ClientIQ
-	if err = c.in.DecodeElement(&iq, nil); err != nil {
-		return nil, errors.New("unmarshal <iq>: " + err.Error())
-	}
-	if &iq.Bind == nil {
-		return nil, errors.New("<iq> result missing <bind>")
-	}
-	c.jid = iq.Bind.Jid // our local id
-
-	if features.Session != nil {
-		// The server needs a session to be established. See RFC 3921,
-		// section 3.
-		fmt.Fprintf(c.out, "<iq to='%s' type='set' id='sess_1'><session xmlns='%s'/></iq>", domain, NsSession)
-		if err = c.in.DecodeElement(&iq, nil); err != nil {
-			return nil, errors.New("xmpp: unmarshal <iq>: " + err.Error())
-		}
-		if iq.Type != "result" {
-			return nil, errors.New("xmpp: session establishment failed")
-		}
+	if err := c.bind(domain, features); err != nil {
+		return nil, err
 	}
 	return c, nil
+}
+
+// DialAuth creates a new connection to an XMPP server, authenticating with
+// the given mechanism.
+// Config.Create has no effect in this mode.
+func DialAuth(address, domain string, auth Auth, config *Config) (*Conn, error) {
+	c, features, err := startConn(address, domain, config)
+	if err != nil {
+		return nil, err
+	}
+
+	var log io.Writer
+	if config != nil && config.Log != nil {
+		log = config.Log
+	}
+
+	if log != nil {
+		io.WriteString(log, "Authenticating\n")
+	}
+	if err := c.authenticate(domain, features, auth); err != nil {
+		return nil, errors.New("xmpp: authentication failed: " + err.Error())
+	}
+	if log != nil {
+		io.WriteString(log, "Authentication successful\n")
+	}
+	if features, err = c.getFeatures(domain); err != nil {
+		return nil, err
+	}
+
+	if err := c.bind(domain, features); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func startConn(address, domain string, config *Config) (*Conn, *streamFeatures, error) {
+	c := new(Conn)
+	c.inflights = make(map[Cookie]inflight)
+	c.archive = config.Archive
+
+	var (
+		log  io.Writer
+		conn net.Conn
+		err  error
+	)
+	if config != nil && config.Log != nil {
+		log = config.Log
+	}
+	if config != nil && config.Conn != nil {
+		conn = config.Conn
+	} else {
+		if log != nil {
+			io.WriteString(log, "Making TCP connection to "+address+"\n")
+		}
+		if conn, err = net.Dial("tcp", address); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	c.in, c.out = makeInOut(conn, config)
+
+	features, err := c.getFeatures(domain)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !config.SkipTLS {
+		if features.StartTLS.XMLName.Local == "" {
+			return nil, nil, errors.New("xmpp: server doesn't support TLS")
+		}
+
+		fmt.Fprintf(c.out, "<starttls xmlns='%s'/>", NsTLS)
+
+		proceed, err := nextStart(c.in)
+		if err != nil {
+			return nil, nil, err
+		}
+		if proceed.Name.Space != NsTLS || proceed.Name.Local != "proceed" {
+			return nil, nil, errors.New("xmpp: expected <proceed> after <starttls> but got <" + proceed.Name.Local + "> in " + proceed.Name.Space)
+		}
+
+		if log != nil {
+			io.WriteString(log, "Starting TLS handshake\n")
+		}
+
+		haveCertHash := len(config.ServerCertificateSHA256) != 0
+		tlsConfig := &tls.Config{
+			ServerName:         domain,
+			InsecureSkipVerify: true,
+		}
+
+		tlsConn := tls.Client(conn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			return nil, nil, err
+		}
+
+		tlsState := tlsConn.ConnectionState()
+		if haveCertHash {
+			h := sha256.New()
+			h.Write(tlsState.PeerCertificates[0].Raw)
+			if digest := h.Sum(nil); !bytes.Equal(digest, config.ServerCertificateSHA256) {
+				return nil, nil, fmt.Errorf("xmpp: server certificate does not match expected hash (got: %x, want: %x)", digest, config.ServerCertificateSHA256)
+			}
+		} else {
+			if len(tlsState.PeerCertificates) == 0 {
+				return nil, nil, errors.New("xmpp: server has no certificates")
+			}
+
+			opts := x509.VerifyOptions{
+				Intermediates: x509.NewCertPool(),
+			}
+			for _, cert := range tlsState.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+			verifiedChains, err := tlsState.PeerCertificates[0].Verify(opts)
+			if err != nil {
+				return nil, nil, errors.New("xmpp: failed to verify TLS certificate: " + err.Error())
+			}
+
+			if log != nil {
+				for i, cert := range verifiedChains[0] {
+					fmt.Fprintf(log, "  certificate %d: %s\n", i, certName(cert))
+				}
+			}
+
+			if err := tlsConn.VerifyHostname(domain); err != nil {
+				if config.TrustedAddress {
+					if log != nil {
+						fmt.Fprintf(log, "Certificate fails to verify against domain in username: %s\n", err)
+					}
+					host, _, err := net.SplitHostPort(address)
+					if err != nil {
+						return nil, nil, errors.New("xmpp: failed to split address when checking whether TLS certificate is valid: " + err.Error())
+					}
+					if err = tlsConn.VerifyHostname(host); err != nil {
+						return nil, nil, errors.New("xmpp: failed to match TLS certificate to address after failing to match to username: " + err.Error())
+					}
+					if log != nil {
+						fmt.Fprintf(log, "Certificate matches against trusted server hostname: %s\n", host)
+					}
+				} else {
+					return nil, nil, errors.New("xmpp: failed to match TLS certificate to name: " + err.Error())
+				}
+			}
+		}
+
+		c.in, c.out = makeInOut(tlsConn, config)
+		c.rawOut = tlsConn
+		c.tls = true
+
+		if features, err = c.getFeatures(domain); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		c.rawOut = conn
+	}
+
+	return c, features, nil
 }
 
 func makeInOut(conn io.ReadWriter, config *Config) (in *xml.Decoder, out io.Writer) {
@@ -682,7 +784,10 @@ type saslAuth struct {
 	Mechanism string   `xml:"mechanism,attr"`
 }
 
-type saslChallenge string
+type saslChallenge struct {
+	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl challenge"`
+	Body    []byte   `xml:",chardata"`
+}
 
 type saslResponse string
 
@@ -692,6 +797,7 @@ type saslAbort struct {
 
 type saslSuccess struct {
 	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl success"`
+	Body    []byte   `xml:",chardata"`
 }
 
 type saslFailure struct {
@@ -713,7 +819,7 @@ type Delay struct {
 	From    string   `xml:"from,attr,omitempty"`
 	Stamp   string   `xml:"stamp,attr"`
 
-	Body    string   `xml:",chardata"`
+	Body string `xml:",chardata"`
 }
 
 // RFC 3921  B.1  jabber:client
@@ -729,7 +835,7 @@ type ClientMessage struct {
 	Subject string `xml:"subject"`
 	Body    string `xml:"body"`
 	Thread  string `xml:"thread"`
-	Delay   *Delay  `xml:"delay,omitempty"`
+	Delay   *Delay `xml:"delay,omitempty"`
 }
 
 type ClientText struct {
@@ -829,7 +935,7 @@ var defaultStorage = map[xml.Name]reflect.Type{
 	xml.Name{Space: NsTLS, Local: "proceed"}:     reflect.TypeOf(tlsProceed{}),
 	xml.Name{Space: NsTLS, Local: "failure"}:     reflect.TypeOf(tlsFailure{}),
 	xml.Name{Space: NsSASL, Local: "mechanisms"}: reflect.TypeOf(saslMechanisms{}),
-	xml.Name{Space: NsSASL, Local: "challenge"}:  reflect.TypeOf(""),
+	xml.Name{Space: NsSASL, Local: "challenge"}:  reflect.TypeOf(saslChallenge{}),
 	xml.Name{Space: NsSASL, Local: "response"}:   reflect.TypeOf(""),
 	xml.Name{Space: NsSASL, Local: "abort"}:      reflect.TypeOf(saslAbort{}),
 	xml.Name{Space: NsSASL, Local: "success"}:    reflect.TypeOf(saslSuccess{}),
